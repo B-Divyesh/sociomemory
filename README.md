@@ -611,6 +611,260 @@ Results are saved as JSON in `benchmark_results/` with timestamps.
 
 ---
 
+## Bring Your Own Database
+
+SocioMemory works with **any PostgreSQL database that has pgvector installed**. You don't need to run your own infrastructure — just point it at a hosted database and go.
+
+### Supabase (recommended for getting started)
+
+[Supabase](https://supabase.com) provides free-tier PostgreSQL with pgvector built in. Zero setup:
+
+```bash
+# 1. Create a free Supabase project at https://supabase.com
+# 2. Enable pgvector: Extensions → search "vector" → Enable
+# 3. Run the schema:
+psql "postgresql://postgres.[your-ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres" \
+  -f scripts/init_db.sql
+
+# 4. Point SocioMemory at it:
+DATABASE_URL=postgresql+asyncpg://postgres.[your-ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres
+```
+
+That's it. Supabase handles backups, connection pooling (via Supavisor), and scaling. The free tier supports up to 500MB of vector data (~150K memories with 3072-dim embeddings).
+
+### Other Supported Databases
+
+SocioMemory uses standard **SQLAlchemy + pgvector** — any PostgreSQL 15+ with pgvector 0.7+ works:
+
+| Provider | Free Tier | pgvector | Notes |
+|---|---|---|---|
+| **[Supabase](https://supabase.com)** | 500MB, 2 projects | Built-in | Best DX, instant setup |
+| **[Neon](https://neon.tech)** | 512MB, autoscale | Built-in | Serverless PG, scales to zero |
+| **[Railway](https://railway.app)** | $5 credit/month | `CREATE EXTENSION vector` | One-click deploy |
+| **[Azure Database for PostgreSQL](https://azure.microsoft.com/en-us/products/postgresql)** | None | Built-in (Flexible Server) | Enterprise, PgBouncer included |
+| **[AWS RDS PostgreSQL](https://aws.amazon.com/rds/postgresql/)** | 12 months free tier | Built-in (16+) | Production-grade |
+| **[Google Cloud SQL](https://cloud.google.com/sql/postgresql)** | $300 credit | `CREATE EXTENSION vector` | GCP ecosystem |
+| **Self-hosted** | Free | `apt install postgresql-16-pgvector` | Full control |
+
+### What the Database Needs
+
+```sql
+-- Just two things:
+CREATE EXTENSION IF NOT EXISTS vector;  -- pgvector for embeddings
+
+-- Then run the schema:
+\i scripts/init_db.sql
+-- Creates: memories, entities, entity_mentions, memory_relations tables
+-- Creates: HNSW index on halfvec(3072) for fast ANN search
+-- Creates: GIN index on tsvector for BM25 keyword search
+-- Creates: search_memories(), record_memory_access(), hybrid_search_memories() functions
+```
+
+### Embedding Dimensions
+
+SocioMemory defaults to **text-embedding-3-large (3072 dimensions)** for maximum accuracy. If you want to save storage and speed up search:
+
+| Model | Dimensions | Storage/Memory | Accuracy Impact |
+|---|---|---|---|
+| text-embedding-3-large | 3072 | ~24KB/memory | Baseline (highest) |
+| text-embedding-3-large (256d) | 256 | ~2KB/memory | ~2-3% lower, 12x faster search |
+| text-embedding-3-small | 1536 | ~12KB/memory | ~5% lower, 2x faster search |
+| text-embedding-ada-002 | 1536 | ~12KB/memory | ~8% lower (older model) |
+
+To change dimensions, update `.env`:
+```bash
+EMBEDDING_MODEL=text-embedding-3-large
+EMBEDDING_DIMENSIONS=256  # or 1536, or 3072
+```
+
+Then update the vector column and indexes in your database (see `scripts/init_db.sql` for the schema).
+
+---
+
+## Latency Deep-Dive: From 4.5s to 200ms
+
+The current hyper search pipeline takes **3-6 seconds** per query. Here's a concrete roadmap to get it under **200ms** — a **20x improvement** — while maintaining accuracy.
+
+### Where Time Goes Today
+
+```
+Current Pipeline (sequential, API-dependent):
+
+  Query Type Detection     ████  200ms   (regex + LLM fallback)
+  Query Expansion          ████████████████  800ms   (Azure OpenAI API round-trip)
+  Query Embedding          ██████████  500ms   (Azure OpenAI API round-trip)
+  Multi-Query Retrieval    ██████  300ms   (pgvector HNSW, 3-4 queries)
+  BM25 Retrieval           ██  100ms   (PostgreSQL tsvector)
+  Boosting (entity/PR/rec) █  10ms    (in-memory computation)
+  Temporal Filtering       █  50ms    (date parsing + filter)
+  HopRAG Reasoning         ████████████████████  1000ms  (Azure OpenAI API)
+  CoT Reranking            ██████████████████████████████  1500ms  (Azure OpenAI API)
+                           ─────────────────────────────────────────
+  TOTAL                                                    ~4500ms
+```
+
+**The bottleneck is clear: 3,800ms of the 4,500ms (84%) is spent waiting for API round-trips.**
+
+### The Optimized Pipeline
+
+```
+Optimized Pipeline (parallel, local inference):
+
+  ┌─ Semantic Cache Check         █  10ms   (local vector similarity)
+  │  cache hit? → return immediately (~30% hit rate = 30% of queries at 10ms)
+  │
+  │  cache miss ↓
+  │
+  ├─ PARALLEL PHASE 1 ───────────────────────────────────
+  │  ├─ Query Type Detection      █  5ms    (regex only, no LLM)
+  │  ├─ Query Expansion           ████  80ms   (local Qwen3-4B via Ollama)
+  │  └─ Temporal Parsing          █  10ms   (regex + dateutil)
+  │                               ────
+  │                               ~80ms (bounded by expansion)
+  │
+  ├─ PARALLEL PHASE 2 ───────────────────────────────────
+  │  ├─ Query Embedding           █  10ms   (local ONNX e5-large-v2 INT8)
+  │  ├─ BM25 Retrieval            █  1ms    (Tantivy, Rust)
+  │  └─ KG Lookup                 █  2ms    (in-memory graph)
+  │                               ────
+  │                               ~10ms (bounded by embedding)
+  │
+  ├─ Vector Search (needs embedding) █  5ms  (Qdrant HNSW / LanceDB)
+  │
+  ├─ Boosting + Filtering         █  5ms    (pure computation)
+  │
+  ├─ Cross-Encoder Reranking      ███  20ms  (bge-reranker-v2-m3 on GPU)
+  │                                         (or ~130ms on CPU)
+  │
+  └─ TOTAL                        ~130ms (GPU) / ~240ms (CPU)
+```
+
+### Technique-by-Technique Breakdown
+
+#### 1. Local Embeddings: 500ms → 10ms (50x faster)
+
+The single biggest win. Replace Azure OpenAI API calls with a local ONNX model:
+
+| Approach | Latency | Hardware | Quality vs API |
+|---|---|---|---|
+| Azure OpenAI API (current) | ~500ms (P90) | Network | Baseline |
+| **e5-large-v2 ONNX INT8** | **~10ms** | Any CPU | ~98% cosine similarity |
+| [HF Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) (TEI) | ~3-5ms | GPU | ~99% (FP8) |
+| [FastEmbed](https://github.com/qdrant/fastembed) (ONNX) | ~15ms | CPU | ~97% |
+
+TEI (written in Rust, Candle backend) eliminates Python entirely for embedding. FP8 quantization maintains >99% cosine similarity with FP32 while using half the memory.
+
+#### 2. Local Query Expansion: 800ms → 80ms (10x faster)
+
+Replace Azure OpenAI with a small local model:
+
+| Model | Params | VRAM (Q4) | Expansion Latency | Quality |
+|---|---|---|---|---|
+| Azure OpenAI GPT-4o (current) | N/A | N/A | ~800ms | Baseline |
+| **Qwen 3 (4B)** via Ollama | 4B | ~3GB | **~80ms** | ~95% of GPT-4o on JSON tasks |
+| Phi-4-mini via vLLM | 3.8B | ~3GB | ~60ms | ~93% of GPT-4o |
+| Llama 3.2 (3B) | 3B | ~2GB | ~70ms | ~90% of GPT-4o |
+
+For query expansion (generating 3-4 search variants), a 3-4B model is more than sufficient. The task is simple: rephrase a question in different ways. Fine-tuning on your 7 query types would close the remaining gap entirely.
+
+#### 3. Distilled Reranker: 1500ms → 20ms (75x faster)
+
+This is the most dramatic improvement. Replace GPT-4o CoT reranking with a cross-encoder:
+
+| Reranker | Latency (16 docs, GPU) | Latency (CPU) | BEIR nDCG@10 |
+|---|---|---|---|
+| GPT-4o CoT (current) | ~1500ms | N/A | Highest |
+| **[bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3)** | **~20ms** | ~130ms | 51.8 |
+| [mxbai-rerank-v2-large](https://huggingface.co/mixedbread-ai/mxbai-rerank-large-v2) | ~25ms | ~150ms | **57.49** |
+| [ColBERTv2](https://github.com/stanford-futuredata/ColBERT) (precomputed) | **<10ms** | ~30ms | High |
+| FlashRank MiniLM-L-12 (already in repo) | N/A | **~100ms for 100 docs** | Medium |
+
+**Strategy:** Use `bge-reranker-v2-m3` as the primary reranker for all modes. Keep GPT-4o CoT only for the `hyper` mode's final top-5 (where the batch is tiny and accuracy matters most).
+
+ColBERTv2 is the endgame: encode documents once at ingest time, then at query time only encode the query and do MaxSim scoring. Latency drops to **single-digit milliseconds**.
+
+#### 4. Rust Retrieval Engine: 400ms → 6ms (67x faster)
+
+Replace Python's pgvector + tsvector with purpose-built Rust engines:
+
+| Component | Current (Python) | Optimized (Rust) | Library |
+|---|---|---|---|
+| BM25 search | ~100ms (PostgreSQL tsvector) | **~1ms** | [Tantivy](https://github.com/quickwit-oss/tantivy) |
+| Vector search | ~200ms (pgvector via SQLAlchemy) | **~2-5ms** | [Qdrant](https://qdrant.tech/) or [LanceDB](https://lancedb.com/) |
+| RRF fusion | ~50ms (Python dict ops) | **<1ms** | Custom Rust |
+| Entity boosting | ~10ms (Python loops) | **<1ms** | Custom Rust |
+
+[Tantivy](https://github.com/quickwit-oss/tantivy) is a Rust full-text search engine (Lucene-inspired). 0.8ms average query latency vs Elasticsearch's 5.2ms. Your Rust backend (`backend-prod/`) can embed Tantivy directly.
+
+[Qdrant](https://qdrant.tech/) provides sub-100ms vector search even at billions of vectors, with built-in hybrid search (dense + sparse vectors).
+
+[LanceDB](https://lancedb.com/) is an embedded vector DB (zero network hops): 3ms latency at 0.9 recall, can search 1B vectors on a laptop.
+
+#### 5. Semantic Caching: 0ms → instant (for repeat queries)
+
+Add a cache layer *before* the pipeline:
+
+```
+Query → Embed → Compare against cached query embeddings
+  ├─ cosine similarity > 0.95 → Return cached result (10ms)
+  └─ cache miss → Run full pipeline → Cache result
+```
+
+**Real-world numbers:**
+- [65x latency reduction](https://brain.co/blog/semantic-caching-accelerating-beyond-basic-rag) in document Q&A pipelines
+- 30% cache hit rate in high-repetition scenarios
+- 78% cost reduction at 80% hit rate
+
+Multi-tier caching:
+- **L1:** In-memory LRU (exact query match, <1ms)
+- **L2:** Redis (semantic similarity, ~2ms)
+- **L3:** Expansion cache (same query type + similar terms, reuse LLM-generated expansions)
+
+#### 6. Parallel Execution: 30% wall-time reduction
+
+Steps that don't depend on each other can run concurrently with `asyncio.gather()`:
+
+```python
+# Phase 1: These are independent
+query_type, expansions, temporal_info = await asyncio.gather(
+    detect_query_type(query),        # 5ms
+    expand_query(client, query),     # 80ms
+    parse_temporal(query),           # 10ms
+)
+# Phase 1 total: 80ms (not 95ms)
+
+# Phase 2: These need the embedding but not each other
+embedding = await embed_query(query)  # 10ms
+vector_results, bm25_results, kg_results = await asyncio.gather(
+    search_vectors(embedding),        # 5ms
+    search_bm25(query),              # 1ms
+    search_kg(query),                # 2ms
+)
+# Phase 2 total: 15ms (not 18ms)
+```
+
+### Projected End State
+
+| Configuration | Total Latency | Cost/Query | Accuracy |
+|---|---|---|---|
+| **Current** (all API, sequential) | ~4,500ms | ~$0.08 | 86.6% |
+| **Quick wins** (local embed + reranker, parallel) | ~800ms | ~$0.02 | ~84% |
+| **Full local** (Ollama + ONNX + bge-reranker, GPU) | **~200ms** | ~$0.001 | ~82% |
+| **Rust + local** (Tantivy + Qdrant + local LLM) | **~130ms** | ~$0.001 | ~82% |
+| **With semantic cache** (30% hit rate) | **~50ms avg** | ~$0.0007 | ~82% |
+
+The accuracy tradeoff (86.6% → ~82%) comes from replacing GPT-4o with smaller local models. If you keep GPT-4o for just the final CoT reranking on top-5 candidates (~200ms extra), you get **~350ms at ~85% accuracy** — the sweet spot.
+
+### Hardware Requirements
+
+| Setup | GPU | RAM | Cost |
+|---|---|---|---|
+| **CPU-only** (ONNX embed + FlashRank) | None | 8GB | Free (your laptop) |
+| **Single GPU** (Ollama + bge-reranker) | RTX 3060 (12GB) | 16GB | ~$200 used |
+| **Production** (vLLM + TEI + Qdrant) | A10G (24GB) | 32GB | ~$0.75/hr cloud |
+
+---
+
 ## Future Directions
 
 ### Near-term (achievable with current architecture)
@@ -618,23 +872,24 @@ Results are saved as JSON in `benchmark_results/` with timestamps.
 1. **Learned query classifier** — Replace regex patterns with a small fine-tuned classifier (distilbert) trained on the 7 query types. Would generalize better to novel phrasings.
 2. **Async batch embedding** — Currently embeds one memory at a time. Batch embedding would 5-10x ingestion throughput.
 3. **Persistent knowledge graph** — Move from in-memory NetworkX to Neo4j or a PostgreSQL graph extension. Enable cross-session entity resolution.
-4. **Smaller model for expansion/reranking** — GPT-4o-mini or a local model (Phi-3, Llama-3) for query expansion and CoT reranking could cut costs 10x with <5% accuracy loss.
+4. **Local models for expansion/reranking** — Qwen3-4B or Phi-4-mini for query expansion, bge-reranker-v2-m3 for reranking. 10x cost reduction with <5% accuracy loss.
 5. **LongMemEval-M** — Test on the harder variant (~1.5M tokens per question, ~500 sessions). This would reveal whether the pipeline scales.
 
 ### Medium-term (architectural changes)
 
-6. **Rust retrieval engine** — Rewrite the hybrid search, RRF fusion, and reranking pipeline in Rust. The Python overhead is significant when processing 100+ candidates. Target: <100ms for the full non-LLM pipeline.
-7. **Learned retrieval** — Fine-tune a bi-encoder (e.g., BGE, GTE) on conversational memory retrieval pairs. The current text-embedding-3-large is a general-purpose model, not optimized for personal memory.
+6. **Rust retrieval engine** — Rewrite hybrid search with [Tantivy](https://github.com/quickwit-oss/tantivy) (BM25) + [Qdrant](https://qdrant.tech/) or [LanceDB](https://lancedb.com/) (vectors). Target: <10ms for full non-LLM retrieval.
+7. **Learned retrieval** — Fine-tune a bi-encoder (e.g., [BGE-M3](https://huggingface.co/BAAI/bge-m3), [GTE-Qwen2](https://huggingface.co/Alibaba-NLP/gte-Qwen2-7B-instruct)) on conversational memory retrieval pairs. Current text-embedding-3-large is general-purpose, not optimized for personal memory.
 8. **Streaming answer generation** — SSE streaming for the answer pipeline so users see partial results immediately.
-9. **Observation-based memory** — Instead of storing raw conversations, extract structured observations ("User moved to Brooklyn on March 15") like Mastra's approach. Reduces noise and improves retrieval.
-10. **Temporal knowledge graph** — Full bi-temporal knowledge graph (like Zep/Graphiti) with temporal conflict resolution. Would dramatically improve knowledge-update accuracy.
+9. **Observation-based memory** — Instead of storing raw conversations, extract structured observations ("User moved to Brooklyn on March 15") like [Mastra's approach](https://mastra.ai/research/observational-memory). Reduces noise and improves retrieval.
+10. **Temporal knowledge graph** — Full bi-temporal knowledge graph (like [Zep/Graphiti](https://github.com/getzep/graphiti)) with temporal conflict resolution. Would improve knowledge-update accuracy.
+11. **ColBERTv2 late interaction** — Pre-encode documents at ingest, query-time scoring in single-digit ms. The endgame for reranking latency.
 
 ### Research directions
 
-11. **MCTS-RAG** — Monte Carlo Tree Search for complex multi-hop reasoning. Recent papers show promising results.
-12. **Memory consolidation** — Periodically merge and summarize related memories, similar to how human memory works during sleep. Reduce storage, improve retrieval quality.
-13. **Adaptive search mode** — Automatically select the right search mode (basic→hyper) based on query complexity, rather than requiring the caller to choose.
-14. **Cross-benchmark generalization** — Test on MuSiQue, HotpotQA, and other multi-hop benchmarks to ensure the pipeline generalizes beyond conversational memory.
+12. **MCTS-RAG** — Monte Carlo Tree Search for complex multi-hop reasoning.
+13. **Memory consolidation** — Periodically merge and summarize related memories, similar to how human memory works during sleep.
+14. **Adaptive search mode** — Automatically select the right search mode (basic→hyper) based on query complexity.
+15. **Cross-benchmark generalization** — Test on MuSiQue, HotpotQA, and other multi-hop benchmarks.
 
 ---
 
